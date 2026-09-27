@@ -1,5 +1,9 @@
-import express, { type Request, type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import type {
+  CaptureFile,
+  CaptureFrame,
+  CaptureVerification,
+  FrameVerification,
   HexRow,
   PacketScenario,
   ParseRequest,
@@ -8,6 +12,7 @@ import type {
   SimulatedPacket,
   TimelineEvent
 } from '../shared/types.js';
+import { CAPTURE_FILE_FORMAT, CAPTURE_FILE_VERSION } from '../shared/types.js';
 
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
@@ -160,6 +165,148 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
 function isProtocol(value: unknown): value is Protocol { return value === 'HTTP' || value === 'TCP'; }
 function isScenario(value: unknown): value is PacketScenario { return value === 'request' || value === 'response' || value === 'handshake'; }
 
+// ---------------------------------------------------------------------------
+// Capture import: structural validation + re-parse verification
+// ---------------------------------------------------------------------------
+
+/** Hard per-request cap is enforced by express.json (1mb); these are semantic caps. */
+const MAX_CAPTURE_FRAMES = 100;
+const MAX_FRAME_RAW_BYTES = 64 * 1024;
+const MAX_FIELD_DEPTH = 10;
+const TIMELINE_PHASES: ReadonlyArray<TimelineEvent['phase']> = ['ingress', 'parse', 'transport', 'application', 'egress'];
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isHexRow(value: unknown): value is HexRow {
+  return isPlainObject(value)
+    && typeof value.offset === 'string'
+    && Array.isArray(value.bytes) && value.bytes.every((byte) => typeof byte === 'string')
+    && typeof value.ascii === 'string';
+}
+
+function isProtocolField(node: unknown, depth = 0): node is ProtocolField {
+  if (depth > MAX_FIELD_DEPTH || !isPlainObject(node)) return false;
+  if (typeof node.id !== 'string' || typeof node.key !== 'string'
+    || typeof node.value !== 'string' || typeof node.description !== 'string') return false;
+  if (node.children === undefined) return true;
+  return Array.isArray(node.children) && node.children.every((child) => isProtocolField(child, depth + 1));
+}
+
+function isTimelineEvent(value: unknown): value is TimelineEvent {
+  return isPlainObject(value)
+    && typeof value.id === 'string'
+    && typeof value.timestamp === 'string'
+    && typeof value.label === 'string'
+    && typeof value.phase === 'string' && TIMELINE_PHASES.includes(value.phase as TimelineEvent['phase'])
+    && typeof value.detail === 'string';
+}
+
+function isSimulatedPacket(value: unknown): value is SimulatedPacket {
+  if (!isPlainObject(value)) return false;
+  return typeof value.id === 'string'
+    && isProtocol(value.protocol)
+    && isScenario(value.scenario)
+    && typeof value.summary === 'string'
+    && typeof value.raw === 'string'
+    && Array.isArray(value.hex) && value.hex.every(isHexRow)
+    && Array.isArray(value.fields) && value.fields.every((node) => isProtocolField(node))
+    && Array.isArray(value.timeline) && value.timeline.every(isTimelineEvent)
+    && isPlainObject(value.metadata)
+    && typeof value.metadata.capturedAt === 'string'
+    && typeof value.metadata.source === 'string'
+    && typeof value.metadata.destination === 'string'
+    && typeof value.metadata.length === 'number' && Number.isFinite(value.metadata.length)
+    && typeof value.metadata.checksum === 'string';
+}
+
+type CaptureValidation =
+  | { ok: true; file: CaptureFile }
+  | { ok: false; status: number; error: string };
+
+function validateCaptureFile(input: unknown): CaptureValidation {
+  if (!isPlainObject(input)) return { ok: false, status: 400, error: '捕获文件必须是一个 JSON 对象' };
+  if (input.format !== CAPTURE_FILE_FORMAT) {
+    return { ok: false, status: 400, error: `无法识别的文件格式（format 应为 "${CAPTURE_FILE_FORMAT}"）` };
+  }
+  // Type is checked before the value so a forged version like "1" (string) is rejected.
+  if (typeof input.version !== 'number' || !Number.isInteger(input.version)) {
+    return { ok: false, status: 400, error: 'version 字段类型错误（必须是整数）' };
+  }
+  if (input.version !== CAPTURE_FILE_VERSION) {
+    return { ok: false, status: 400, error: `不支持的捕获文件版本 v${input.version}（当前仅支持 v${CAPTURE_FILE_VERSION}）` };
+  }
+  if (input.kind !== 'frame' && input.kind !== 'session') {
+    return { ok: false, status: 400, error: 'kind 字段非法（必须是 "frame" 或 "session"）' };
+  }
+  if (typeof input.exportedAt !== 'string' || Number.isNaN(Date.parse(input.exportedAt))) {
+    return { ok: false, status: 400, error: 'exportedAt 必须是有效的 ISO 时间字符串' };
+  }
+  if (!Array.isArray(input.frames) || input.frames.length === 0) {
+    return { ok: false, status: 400, error: 'frames 必须是非空数组' };
+  }
+  if (input.frames.length > MAX_CAPTURE_FRAMES) {
+    return { ok: false, status: 413, error: `捕获文件包含 ${input.frames.length} 帧，超过 ${MAX_CAPTURE_FRAMES} 帧上限` };
+  }
+  for (let index = 0; index < input.frames.length; index += 1) {
+    const label = `第 ${index + 1} 帧`;
+    const frame = input.frames[index];
+    if (!isPlainObject(frame)) return { ok: false, status: 400, error: `${label}必须是对象` };
+    if (!isProtocol(frame.protocol)) return { ok: false, status: 400, error: `${label}的 protocol 字段缺失或非法` };
+    if (!isScenario(frame.scenario)) return { ok: false, status: 400, error: `${label}的 scenario 字段缺失或非法` };
+    if (typeof frame.raw !== 'string') return { ok: false, status: 400, error: `${label}的 raw 必须是字符串` };
+    if (!frame.raw.trim()) return { ok: false, status: 400, error: `${label}的 raw 不能为空` };
+    if (Buffer.byteLength(frame.raw, 'utf8') > MAX_FRAME_RAW_BYTES) {
+      return { ok: false, status: 413, error: `${label}的原始输入超过 ${MAX_FRAME_RAW_BYTES / 1024}KB 上限` };
+    }
+    if (!isSimulatedPacket(frame.packet)) {
+      return { ok: false, status: 400, error: `${label}的 packet 结构不完整或字段类型被篡改` };
+    }
+  }
+  return { ok: true, file: input as unknown as CaptureFile };
+}
+
+/** Order-independent JSON serialization for structural comparison. */
+function canonicalize(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalize(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * Re-runs the parser on the stored raw input and reports which aspects of the
+ * stored result differ. `id` and `metadata.capturedAt` are regenerated on
+ * every parse and are deliberately excluded.
+ */
+function diffStoredFrame(frame: CaptureFrame): string[] {
+  const reparsed = buildPacket(frame.protocol, frame.scenario, frame.raw);
+  const stored = frame.packet;
+  const mismatches: string[] = [];
+  if (stored.protocol !== frame.protocol) mismatches.push('packet.protocol');
+  if (stored.scenario !== frame.scenario) mismatches.push('packet.scenario');
+  if (stored.raw !== frame.raw) mismatches.push('packet.raw');
+  const checks: Array<[string, unknown, unknown]> = [
+    ['summary', stored.summary, reparsed.summary],
+    ['hex', stored.hex, reparsed.hex],
+    ['fields', stored.fields, reparsed.fields],
+    ['timeline', stored.timeline, reparsed.timeline],
+    ['metadata.source', stored.metadata.source, reparsed.metadata.source],
+    ['metadata.destination', stored.metadata.destination, reparsed.metadata.destination],
+    ['metadata.length', stored.metadata.length, reparsed.metadata.length],
+    ['metadata.checksum', stored.metadata.checksum, reparsed.metadata.checksum]
+  ];
+  for (const [label, storedValue, reparsedValue] of checks) {
+    if (canonicalize(storedValue) !== canonicalize(reparsedValue)) mismatches.push(label);
+  }
+  return mismatches;
+}
+
 app.get('/api/health', (_request, response) => response.json({ ok: true, service: 'network-packet-lab-api' }));
 
 app.get('/api/simulate', (request, response) => {
@@ -180,6 +327,42 @@ app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>
   const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
   if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
   response.json({ data: buildPacket(protocol, scenario, raw) });
+});
+
+app.post('/api/captures/verify', (request: Request, response: Response) => {
+  const validation = validateCaptureFile(request.body);
+  if (!validation.ok) return response.status(validation.status).json({ error: validation.error });
+  const frames: FrameVerification[] = validation.file.frames.map((frame, index) => {
+    const mismatches = diffStoredFrame(frame);
+    return {
+      index,
+      protocol: frame.protocol,
+      scenario: frame.scenario,
+      summary: frame.packet.summary,
+      status: mismatches.length ? 'mismatch' : 'match',
+      mismatches
+    };
+  });
+  const data: CaptureVerification = {
+    version: validation.file.version,
+    kind: validation.file.kind,
+    exportedAt: validation.file.exportedAt,
+    frameCount: frames.length,
+    frames
+  };
+  response.json({ data });
+});
+
+// Turn body-parser errors (oversized payload, invalid JSON) into JSON messages.
+app.use((error: unknown, _request: Request, response: Response, next: NextFunction) => {
+  const typed = error as { type?: string };
+  if (typed?.type === 'entity.too.large') {
+    return response.status(413).json({ error: '请求体超过 1MB 上限，捕获文件过大' });
+  }
+  if (typed?.type === 'entity.parse.failed') {
+    return response.status(400).json({ error: '请求体不是合法的 JSON' });
+  }
+  return next(error);
 });
 
 app.listen(port, () => {

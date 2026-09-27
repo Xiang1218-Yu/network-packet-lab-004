@@ -37,6 +37,7 @@ network-packet-lab/
 4. **十六进制视图**：以 offset、hex bytes、ASCII 三列展示当前 payload 的 UTF-8 字节。
 5. **传输时间线**：展示抓包、解析、传输层解码和结构化输出等阶段。
 6. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/simulate`、`/api/packets` 和 `/api/health`。
+7. **捕获导入 / 导出**：把一次分析完整导出为带版本号的 JSON 文件（单帧或整个会话），导入时先由后端校验格式并重新解析逐帧比对，预览确认后才覆盖当前会话。
 
 ## 启动方式
 
@@ -93,6 +94,46 @@ curl -X POST 'http://localhost:3001/api/parse' \
 ```bash
 curl 'http://localhost:3001/api/packets?protocol=TCP'
 ```
+
+### 校验待导入的捕获文件
+
+```bash
+curl -X POST 'http://localhost:3001/api/captures/verify' \
+  -H 'Content-Type: application/json' \
+  --data-binary @packet-lab-session-2026-09-26.json
+```
+
+返回中每一帧带 `status: "match" | "mismatch"` 与 `mismatches` 差异列表（如 `fields`、`hex`、`metadata.checksum`）。
+服务端拒绝情况：未知/类型伪造的 `version`（如字符串 `"1"`）返回 400；非数组的 `frames`、篡改类型的 packet 字段返回 400；请求体超过 1MB、超过 100 帧、单帧 raw 超过 64KB 返回 413。
+
+## 捕获文件格式
+
+所有导出文件均为 JSON，UTF-8 编码，扩展名 `.json`：
+
+```json
+{
+  "format": "network-packet-lab/capture",
+  "version": 1,
+  "kind": "frame",
+  "exportedAt": "2026-09-26T08:30:00.000Z",
+  "frames": [
+    {
+      "protocol": "HTTP",
+      "scenario": "request",
+      "raw": "GET /health HTTP/1.1\r\nHost: lab.local\r\n\r\n",
+      "packet": { "id": "...", "fields": [], "hex": [], "timeline": [], "metadata": {} }
+    }
+  ]
+}
+```
+
+- `format`：固定魔数标识，不匹配直接拒绝；
+- `version`：格式版本（当前为 `1`），服务端只接受精确匹配的已知版本；
+- `kind`：`frame`（当前帧）或 `session`（整个会话）；
+- `exportedAt`：导出时间（ISO 8601）；
+- `frames[]`：每帧包含**协议、场景、原始输入（raw）、解析结果（完整 `SimulatedPacket`）**。
+
+导入流程：选择文件 → 前端预检大小与 JSON 合法性 → 后端 `/api/captures/verify` 做结构/类型/版本/大小校验，并对每帧用当前解析器重新解析，与文件内存储的解析结果逐项比对 → 前端预览弹窗逐帧展示「一致 / 不一致（差异方面）」→ 用户确认后才会覆盖当前会话；存在不一致时按钮变为「仍要导入」，导入后页面顶部保留琥珀色警示条。重新生成的 `id` 与 `capturedAt` 不参与比对。
 
 ## 说明
 
